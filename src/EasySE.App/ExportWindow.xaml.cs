@@ -39,7 +39,8 @@ public partial class ExportWindow : Window
         try
         {
             using var renderer = new ExportRenderer(project);
-            Result = await VideoExporter.RunAsync(new(project, source, directory, FileName.Text.Trim(), renderer.Compose), progress, cancellation.Token);
+            Result = await VideoExporter.RunAsync(new(project, source, directory, FileName.Text.Trim(), renderer.Compose)
+                { NeedsComposition = renderer.NeedsComposition }, progress, cancellation.Token);
             running = false; DialogResult = true;
         }
         catch (OperationCanceledException) { Stage.Text = "已取消"; }

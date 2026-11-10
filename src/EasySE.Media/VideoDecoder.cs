@@ -38,6 +38,29 @@ public sealed unsafe class VideoDecoder : IDisposable
     }
     public VideoFrame At(double seconds, CancellationToken cancellation = default)
     {
+        Locate(seconds, cancellation);
+        return CurrentPixels();
+    }
+    internal ExportPicture AtForExport(double seconds, NativeEncoding? encoding, CancellationToken cancellation)
+    {
+        Locate(seconds, cancellation);
+        // Skip RGB conversion only when format, dimensions and color interpretation agree.
+        // Rotated, high-bit-depth, differently ranged/colored frames keep the proven BGRA path.
+        if (encoding is not null && Info.Rotation == 0 && current->width == rawWidth && current->height == rawHeight &&
+            (current->format == (int)encoding.Format || current->format == (int)AVPixelFormat.AV_PIX_FMT_YUVJ420P &&
+                encoding.Format == AVPixelFormat.AV_PIX_FMT_YUV420P && encoding.Range == AVColorRange.AVCOL_RANGE_JPEG) &&
+            current->color_range == encoding.Range && current->colorspace == encoding.Space &&
+            current->color_primaries == encoding.Primaries && current->color_trc == encoding.Transfer)
+            return new ExportPicture(current, currentTime);
+        return new ExportPicture(CurrentPixels());
+    }
+    private VideoFrame CurrentPixels()
+    {
+        if (cached is null || changed) { cached = ConvertCurrent(); changed = false; }
+        return cached;
+    }
+    private void Locate(double seconds, CancellationToken cancellation)
+    {
         if (codec == null) throw new ObjectDisposedException(nameof(VideoDecoder));
         cancellation.ThrowIfCancellationRequested();
         seconds = Math.Clamp(seconds, 0, Info.Duration);
@@ -63,8 +86,6 @@ public sealed unsafe class VideoDecoder : IDisposable
             else { ffmpeg.av_frame_unref(next); ffmpeg.av_frame_move_ref(next, decoded); nextTime = time; hasNext = true; break; }
         }
         if (!hasCurrent) throw new InvalidOperationException("视频没有可解码的画面");
-        if (cached is null || changed) { cached = ConvertCurrent(); changed = false; }
-        return cached;
     }
     private bool ReadNative(CancellationToken cancellation)
     {

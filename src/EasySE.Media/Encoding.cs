@@ -14,7 +14,12 @@ internal sealed unsafe class H264Encoder : IDisposable
     private SwsContext* scaler;
     private BgraBuffer? inputBuffer;
     private readonly PacketSink? sink;
-    public H264Encoder(int width, int height, long bitrate, int pass, string statistics, PacketSink? sink, SpliceEncoding? splice = null)
+    internal long NativeFrames { get; private set; }
+    internal long BgraFrames { get; private set; }
+    internal NativeEncoding NativeFormat => new(Context->pix_fmt, Context->color_range, Context->colorspace,
+        Context->color_primaries, Context->color_trc);
+    public H264Encoder(int width, int height, long bitrate, int pass, string statistics, PacketSink? sink, SpliceEncoding? splice = null,
+        SpliceEncoding? sourceColor = null)
     {
         this.sink = sink;
         try
@@ -33,6 +38,13 @@ internal sealed unsafe class H264Encoder : IDisposable
             else if (pass == 2) Context->flags |= ffmpeg.AV_CODEC_FLAG_PASS2;
             Context->color_range = AVColorRange.AVCOL_RANGE_MPEG; Context->colorspace = AVColorSpace.AVCOL_SPC_BT709;
             Context->color_primaries = AVColorPrimaries.AVCOL_PRI_BT709; Context->color_trc = AVColorTransferCharacteristic.AVCOL_TRC_BT709;
+            var color = splice ?? sourceColor;
+            if (color is not null)
+            {
+                Context->color_range = color.Range; Context->colorspace = color.Space;
+                Context->color_primaries = color.Primaries; Context->color_trc = color.Transfer;
+                Context->chroma_sample_location = color.Chroma;
+            }
             if (splice is not null)
             {
                 // No local reordering. The splice writer applies the source track's constant
@@ -52,20 +64,35 @@ internal sealed unsafe class H264Encoder : IDisposable
             inputBuffer = new BgraBuffer(width, height);
             scaler = ffmpeg.sws_getContext(width, height, AVPixelFormat.AV_PIX_FMT_BGRA, width, height, Context->pix_fmt, (int)SwsFlags.SWS_BILINEAR, null, null, null);
             if (scaler == null) throw new InvalidOperationException("无法初始化编码颜色转换");
-            var coefficients = ffmpeg.sws_getCoefficients(splice is null || splice.Space == AVColorSpace.AVCOL_SPC_BT709 ? 1 : 5);
+            var coefficients = ffmpeg.sws_getCoefficients(color is null || color.Space == AVColorSpace.AVCOL_SPC_BT709 ? 1 : 5);
             NativeRuntime.Check(ffmpeg.sws_setColorspaceDetails(scaler, *(int_array4*)coefficients, 1, *(int_array4*)coefficients,
-                splice?.Range == AVColorRange.AVCOL_RANGE_JPEG ? 1 : 0, 0, 1 << 16, 1 << 16), "设置编码色彩");
+                color?.Range == AVColorRange.AVCOL_RANGE_JPEG ? 1 : 0, 0, 1 << 16, 1 << 16), "设置编码色彩");
         }
         catch { Dispose(); throw; }
     }
     public void Write(VideoFrame pixels, long index)
     {
+        BgraFrames++;
         inputBuffer!.CopyFrom(pixels);
         NativeRuntime.Check(ffmpeg.av_frame_make_writable(frame), "准备编码画面");
         var input = inputBuffer.Frame;
         NativeRuntime.Check(ffmpeg.sws_scale(scaler, input->data, input->linesize, 0, pixels.Height, frame->data, frame->linesize), "转换编码画面");
         frame->pts = index;
         NativeRuntime.Check(ffmpeg.avcodec_send_frame(Context, frame), "编码视频画面"); Drain();
+    }
+    internal void Write(ExportPicture picture, long index)
+    {
+        if (picture.Native == null) { Write(picture.Pixels!, index); return; }
+        // The cloned AVFrame owns its buffer references. x264 retains any references it needs;
+        // disposing this queue item after send_frame cannot invalidate the encoder or decoder.
+        var native = picture.Native;
+        if (native->width != Context->width || native->height != Context->height)
+            throw new InvalidDataException("原生导出画面尺寸不匹配");
+        native->format = (int)Context->pix_fmt; native->pts = index;
+        native->time_base = Context->time_base; native->duration = 1;
+        native->pict_type = AVPictureType.AV_PICTURE_TYPE_NONE;
+        NativeRuntime.Check(ffmpeg.avcodec_send_frame(Context, native), "编码原生视频画面");
+        NativeFrames++; Drain();
     }
     public void Flush() { NativeRuntime.Check(ffmpeg.avcodec_send_frame(Context, null), "完成视频编码"); Drain(); }
     private void Drain()
@@ -157,11 +184,11 @@ internal sealed unsafe class Mp4Muxer : IDisposable
     private AVFormatContext* format;
     private AVStream* video;
     private AVStream* audio;
-    public Mp4Muxer(string path, AVCodecContext* videoCodec, AVCodecContext* audioCodec)
-        : this(path, videoCodec, null, default, audioCodec) { }
-    public Mp4Muxer(string path, AVCodecParameters* sourceVideo, AVRational sourceTimeBase, AVCodecContext* audioCodec)
-        : this(path, null, sourceVideo, sourceTimeBase, audioCodec) { }
-    private Mp4Muxer(string path, AVCodecContext* videoCodec, AVCodecParameters* sourceVideo, AVRational sourceTimeBase, AVCodecContext* audioCodec)
+    public Mp4Muxer(string path, AVCodecContext* videoCodec, AVStream* sourceAudio)
+        : this(path, videoCodec, null, default, sourceAudio) { }
+    public Mp4Muxer(string path, AVCodecParameters* sourceVideo, AVRational sourceTimeBase, AVStream* sourceAudio)
+        : this(path, null, sourceVideo, sourceTimeBase, sourceAudio) { }
+    private Mp4Muxer(string path, AVCodecContext* videoCodec, AVCodecParameters* sourceVideo, AVRational sourceTimeBase, AVStream* sourceAudio)
     {
         try
         {
@@ -178,11 +205,14 @@ internal sealed unsafe class Mp4Muxer : IDisposable
                 video->time_base = videoCodec->time_base; video->avg_frame_rate = videoCodec->framerate;
                 NativeRuntime.Check(ffmpeg.avcodec_parameters_from_context(video->codecpar, videoCodec), "设置 MP4 视频流");
             }
-            if (audioCodec != null)
+            if (sourceAudio != null)
             {
                 audio = ffmpeg.avformat_new_stream(format, null); if (audio == null) throw new OutOfMemoryException();
-                audio->time_base = audioCodec->time_base;
-                NativeRuntime.Check(ffmpeg.avcodec_parameters_from_context(audio->codecpar, audioCodec), "设置 MP4 音频流");
+                audio->time_base = sourceAudio->time_base;
+                audio->disposition = sourceAudio->disposition;
+                NativeRuntime.Check(ffmpeg.avcodec_parameters_copy(audio->codecpar, sourceAudio->codecpar), "复制 MP4 音频规格");
+                audio->codecpar->codec_tag = 0;
+                NativeRuntime.Check(ffmpeg.av_dict_copy(&audio->metadata, sourceAudio->metadata, 0), "复制音频元数据");
             }
             AVIOContext* io = null; NativeRuntime.Check(ffmpeg.avio_open(&io, path, ffmpeg.AVIO_FLAG_WRITE), "打开导出临时文件"); format->pb = io;
             AVDictionary* options = null;

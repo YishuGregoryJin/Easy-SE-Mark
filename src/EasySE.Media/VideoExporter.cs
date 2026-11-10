@@ -11,7 +11,11 @@ public sealed record ExportResult(string Path, long Bytes, int Attempts)
     public long RenderedFrames { get; init; }
 }
 public sealed record ExportRequest(Project Project, string? SourcePath, string Directory, string Name,
-    Func<VideoFrame?, double, VideoFrame> Compose);
+    Func<VideoFrame?, double, VideoFrame> Compose)
+{
+    // Optional, immutable/thread-safe schedule. Null keeps custom compositors on the BGRA path.
+    public Func<double, bool>? NeedsComposition { get; init; }
+}
 
 public static class VideoExporter
 {
@@ -25,6 +29,10 @@ public static class VideoExporter
         if (info is null) throw new InvalidOperationException("请连接视频");
         if (info.Width != project.Video.Width || info.Height != project.Video.Height || Math.Abs(info.Duration - duration) > .25)
             throw new InvalidOperationException("项目与源视频不匹配，请重新连接");
+        var sourceBytes = new FileInfo(info.Path).Length;
+        // Small originals and original-audio preservation explicitly permit larger deliveries.
+        var allowOversize = sourceBytes <= ExportPolicy.MaxBytes || info.HasAudio;
+        var sourceColor = NativeEncoding.SourceColor(info.Path);
         var cache = Environment.GetEnvironmentVariable("EASYSE_CACHE_DIR") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "EasySEMark", "cache");
         var jobId = Guid.NewGuid().ToString("N");
         var job = Path.Combine(Path.GetFullPath(cache), "exports", jobId); Directory.CreateDirectory(job);
@@ -33,7 +41,8 @@ public static class VideoExporter
         string? pendingDelivery = null;
         try
         {
-            log.Write("start", new { source = Path.GetFileName(info.Path), info.Width, info.Height, duration, info.VideoCodec, info.HasAudio, native = NativeRuntime.Version });
+            log.Write("start", new { source = Path.GetFileName(info.Path), sourceBytes, allowOversize, audioMode = info.HasAudio ? "copy" : "none",
+                info.Width, info.Height, duration, info.VideoCodec, info.HasAudio, native = NativeRuntime.Version });
             var smartReady = false; SmartPlan? smartPlan = null;
             var smartWatch = Stopwatch.StartNew();
             try
@@ -48,7 +57,7 @@ public static class VideoExporter
                     var output = Path.Combine(job, "output.mp4");
                     SmartVideoExporter.Render(request, info, smartPlan, output, progress, cancellation, log);
                     var bytes = new FileInfo(output).Length; var actual = MediaProbe.Read(output);
-                    ExportPolicy.Verify(bytes, actual.VideoCodec, actual.Width, actual.Height, project.Video, actual.FrameRate);
+                    ExportPolicy.Verify(bytes, actual.VideoCodec, actual.Width, actual.Height, project.Video, actual.FrameRate, allowOversize);
                     if (actual.HasAudio != info.HasAudio) throw new InvalidDataException("智能导出音频流校验失败");
                     SmartVideoExporter.Validate(output, smartPlan.OutputFrames, info.Width, info.Height, progress, cancellation);
                     smartReady = true;
@@ -78,21 +87,26 @@ public static class VideoExporter
                         var count = (long)Math.Ceiling(duration * 30 - .000001);
                         var prefetch = ExportFrameReader.ShouldPrefetch(info.Width, info.Height, count);
                         log.Write("pass-start", new { attempt, pass, preset = H264Encoder.Preset, prefetch, queuedFrames = prefetch ? 1 : 0, budget.VideoBitsPerSecond, budget.AudioBitsPerSecond });
-                        using var decoder = new ExportFrameReader(info.Path, count, prefetch, cancellation);
                         Mp4Muxer? muxer = null;
                         using var video = new H264Encoder(project.Video.Width, project.Video.Height, budget.VideoBitsPerSecond, pass, stats,
-                            !finalPass ? null : (packet, codec) => muxer!.Write(packet, codec, false));
-                        using var audio = finalPass && info.HasAudio ? new AacEncoder(info.Path, duration, budget.AudioBitsPerSecond, (packet, codec) => muxer!.Write(packet, codec, true)) : null;
-                        using var outputMuxer = !finalPass ? null : new Mp4Muxer(output, video.Context, audio is null ? null : audio.Context);
+                            !finalPass ? null : (packet, codec) => muxer!.Write(packet, codec, false), sourceColor: sourceColor);
+                        using var decoder = new ExportFrameReader(info.Path, count, prefetch, cancellation,
+                            preserveColor: sourceColor is not null, nativeEncoding: video.NativeFormat, needsComposition: request.NeedsComposition);
+                        using var audio = finalPass && info.HasAudio ? new AudioPacketCopier(info.Path, (packet, timeBase) => muxer!.Write(packet, timeBase, true)) : null;
+                        using var outputMuxer = !finalPass ? null : new Mp4Muxer(output, video.Context, audio is null ? null : audio.Stream);
                         muxer = outputMuxer;
                         for (long index = 0; index < count; index++)
                         {
                             cancellation.ThrowIfCancellationRequested(); var time = index / 30.0;
-                            var source = decoder.At(index);
-                            var tick = Stopwatch.GetTimestamp(); var frame = request.Compose(source, time);
+                            using var source = decoder.Read(index);
+                            var tick = Stopwatch.GetTimestamp();
+                            VideoFrame? frame = null;
+                            if (request.NeedsComposition is null || request.NeedsComposition(time))
+                                frame = request.Compose(source.Pixels, time);
                             composeTicks += Stopwatch.GetTimestamp() - tick;
                             cancellation.ThrowIfCancellationRequested();
-                            tick = Stopwatch.GetTimestamp(); video.Write(frame, index);
+                            tick = Stopwatch.GetTimestamp();
+                            if (frame is not null) video.Write(frame, index); else video.Write(source, index);
                             videoTicks += Stopwatch.GetTimestamp() - tick;
                             tick = Stopwatch.GetTimestamp(); audio?.WriteUntil(Math.Min(duration, (index + 1) / 30.0), cancellation);
                             audioTicks += Stopwatch.GetTimestamp() - tick;
@@ -101,14 +115,15 @@ public static class VideoExporter
                                 (passIndex + (index + 1) / (double)count) / passes.Count * 98,
                                 pass == 0 ? (attempt == 1 ? "渲染" : $"第 {attempt} 次 · 渲染") : $"第 {attempt} 次 · {pass}/2"));
                         }
-                        video.Flush(); audio?.Flush(); outputMuxer?.Finish();
+                        video.Flush(); audio?.Finish(cancellation); outputMuxer?.Finish();
                         log.Write("pass-finished", new { attempt, pass, elapsedSeconds = passWatch.Elapsed.TotalSeconds,
                             decodeSeconds = decoder.DecodeTicks / (double)Stopwatch.Frequency, composeSeconds = composeTicks / (double)Stopwatch.Frequency,
                             videoSeconds = videoTicks / (double)Stopwatch.Frequency, audioSeconds = audioTicks / (double)Stopwatch.Frequency,
+                            nativeFrames = video.NativeFrames, bgraFrames = video.BgraFrames, audioPackets = audio?.Packets ?? 0, audioBytes = audio?.Bytes ?? 0,
                             framesPerSecond = count / passWatch.Elapsed.TotalSeconds });
                     }
                     cancellation.ThrowIfCancellationRequested(); var bytes = new FileInfo(output).Length;
-                    if (bytes > ExportPolicy.MaxBytes)
+                    if (!allowOversize && bytes > ExportPolicy.MaxBytes)
                     {
                         if (attempt == ExportPolicy.MaxAttempts) throw new InvalidOperationException("导出文件无法控制在 100 MB 内，未交付超限文件");
                         log.Write("size-retry", new { attempt, bytes });
@@ -116,7 +131,7 @@ public static class VideoExporter
                     }
                     progress?.Report(new(attempt, passes[^1], 98, "校验"));
                     var actual = MediaProbe.Read(output);
-                    ExportPolicy.Verify(bytes, actual.VideoCodec, actual.Width, actual.Height, project.Video, actual.FrameRate);
+                    ExportPolicy.Verify(bytes, actual.VideoCodec, actual.Width, actual.Height, project.Video, actual.FrameRate, allowOversize);
                     if (actual.HasAudio != info.HasAudio) throw new InvalidDataException("导出音频流校验失败");
                     cancellation.ThrowIfCancellationRequested();
                     log.Write("validated", new { bytes, actual.Width, actual.Height, actual.FrameRate, actual.HasAudio });

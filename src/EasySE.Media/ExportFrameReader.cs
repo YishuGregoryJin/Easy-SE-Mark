@@ -7,13 +7,15 @@ namespace EasySE.Media;
 /// <summary>One thread-confined decoder; at most one queued frame. No compositor output crosses threads.</summary>
 internal sealed class ExportFrameReader : IDisposable
 {
-    private readonly record struct Decoded(long Index, VideoFrame Frame, long Ticks);
+    private readonly record struct Decoded(long Index, ExportPicture Frame, long Ticks);
     private readonly BlockingCollection<Decoded>? frames;
     private readonly CancellationTokenSource cancellation;
     private readonly Thread? worker;
     private readonly VideoDecoder? serial;
     private ExceptionDispatchInfo? failure;
     private bool disposed;
+    private readonly NativeEncoding? nativeEncoding;
+    private readonly Func<double, bool>? needsComposition;
     internal long DecodeTicks { get; private set; }
     internal bool PrefetchEnabled => worker is not null;
     internal bool WorkerAlive => worker?.IsAlive == true;
@@ -21,9 +23,11 @@ internal sealed class ExportFrameReader : IDisposable
     internal static bool ShouldPrefetch(int width, int height, long count) =>
         Environment.ProcessorCount >= 4 && count >= 60 && (long)width * height * 4 <= 32 * 1024 * 1024;
 
-    internal ExportFrameReader(string path, long count, bool prefetch, CancellationToken cancellation, long startIndex = 0, bool preserveColor = false)
+    internal ExportFrameReader(string path, long count, bool prefetch, CancellationToken cancellation, long startIndex = 0, bool preserveColor = false,
+        NativeEncoding? nativeEncoding = null, Func<double, bool>? needsComposition = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(startIndex);
+        this.nativeEncoding = nativeEncoding; this.needsComposition = needsComposition;
         this.cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         if (!prefetch)
         {
@@ -48,8 +52,9 @@ internal sealed class ExportFrameReader : IDisposable
             for (long index = startIndex; index < startIndex + count; index++)
             {
                 cancellation.Token.ThrowIfCancellationRequested();
-                var start = Stopwatch.GetTimestamp(); var frame = decoder.At(index / 30.0, cancellation.Token);
-                frames!.Add(new(index, frame, Stopwatch.GetTimestamp() - start), cancellation.Token);
+                var start = Stopwatch.GetTimestamp(); var frame = Decode(decoder, index);
+                try { frames!.Add(new(index, frame, Stopwatch.GetTimestamp() - start), cancellation.Token); }
+                catch { frame.Dispose(); throw; }
             }
         }
         catch (Exception ex) { Volatile.Write(ref failure, ExceptionDispatchInfo.Capture(ex)); }
@@ -57,15 +62,26 @@ internal sealed class ExportFrameReader : IDisposable
     }
     internal VideoFrame At(long index)
     {
+        using var picture = Read(index);
+        return picture.Pixels ?? throw new InvalidOperationException("原生导出帧不能作为 BGRA 读取");
+    }
+    private ExportPicture Decode(VideoDecoder decoder, long index)
+    {
+        var time = index / 30.0;
+        var encoding = needsComposition is not null && !needsComposition(time) ? nativeEncoding : null;
+        return decoder.AtForExport(time, encoding, cancellation.Token);
+    }
+    internal ExportPicture Read(long index)
+    {
         cancellation.Token.ThrowIfCancellationRequested();
         if (serial is not null)
         {
-            var start = Stopwatch.GetTimestamp(); var frame = serial.At(index / 30.0, cancellation.Token);
+            var start = Stopwatch.GetTimestamp(); var frame = Decode(serial, index);
             DecodeTicks += Stopwatch.GetTimestamp() - start; return frame;
         }
         if (frames!.TryTake(out var decoded, Timeout.Infinite, cancellation.Token))
         {
-            if (decoded.Index != index) throw new InvalidOperationException("导出解码帧顺序异常");
+            if (decoded.Index != index) { decoded.Frame.Dispose(); throw new InvalidOperationException("导出解码帧顺序异常"); }
             DecodeTicks += decoded.Ticks; return decoded.Frame;
         }
         Volatile.Read(ref failure)?.Throw();
@@ -74,6 +90,8 @@ internal sealed class ExportFrameReader : IDisposable
     public void Dispose()
     {
         if (disposed) return; disposed = true;
-        cancellation.Cancel(); worker?.Join(); serial?.Dispose(); frames?.Dispose(); cancellation.Dispose();
+        cancellation.Cancel(); worker?.Join(); serial?.Dispose();
+        if (frames is not null) { while (frames.TryTake(out var pending)) pending.Frame.Dispose(); frames.Dispose(); }
+        cancellation.Dispose();
     }
 }

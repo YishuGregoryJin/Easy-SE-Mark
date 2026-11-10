@@ -18,10 +18,29 @@ internal sealed class ExportRenderer : IDisposable
     private readonly BlockingCollection<Request> requests = new(1);
     private readonly Thread thread;
     private readonly TaskCompletionSource initialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly (double Start, double End)[] intervals;
     public ExportRenderer(Project project)
     {
+        var merged = new List<(double Start, double End)>();
+        foreach (var marker in project.Markers.OrderBy(m => m.Start))
+        {
+            if (merged.Count > 0 && marker.Start <= merged[^1].End)
+                merged[^1] = (merged[^1].Start, Math.Max(merged[^1].End, marker.End));
+            else merged.Add((marker.Start, marker.End));
+        }
+        intervals = merged.ToArray();
         thread = new Thread(() => Work(project)) { IsBackground = true, Name = "Easy SE Mark export compositor" };
         thread.SetApartmentState(ApartmentState.STA); thread.Start(); initialized.Task.GetAwaiter().GetResult();
+    }
+    public bool NeedsComposition(double time)
+    {
+        var target = time + .000001; var low = 0; var high = intervals.Length;
+        while (low < high)
+        {
+            var middle = low + (high - low) / 2;
+            if (intervals[middle].Start <= target) low = middle + 1; else high = middle;
+        }
+        return low > 0 && intervals[low - 1].End > target;
     }
     public VideoFrame Compose(VideoFrame? source, double time)
     {

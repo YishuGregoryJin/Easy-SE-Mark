@@ -16,11 +16,11 @@ internal static unsafe class SmartVideoExporter
         var extra = new ReadOnlySpan<byte>(par->extradata, par->extradata_size).ToArray();
         var budget = ExportPolicy.Budget(request.Project.Video.Duration, info.HasAudio);
         Mp4Muxer? muxer = null;
-        using var audio = info.HasAudio ? new AacEncoder(info.Path, request.Project.Video.Duration, budget.AudioBitsPerSecond,
-            (packet, codec) => muxer!.Write(packet, codec, true)) : null;
-        using var writer = new Mp4Muxer(output, par, timeBase, audio is null ? null : audio.Context); muxer = writer;
+        using var audio = info.HasAudio ? new AudioPacketCopier(info.Path,
+            (packet, audioTimeBase) => muxer!.Write(packet, audioTimeBase, true)) : null;
+        using var writer = new Mp4Muxer(output, par, timeBase, audio is null ? null : audio.Stream); muxer = writer;
         var packet = ffmpeg.av_packet_alloc(); if (packet == null) throw new OutOfMemoryException();
-        long inputIndex = 0, copied = 0, encoded = 0;
+        long inputIndex = 0, copied = 0, encoded = 0, nativeFrames = 0, bgraFrames = 0;
         try
         {
             foreach (var block in plan.Blocks)
@@ -46,8 +46,6 @@ internal static unsafe class SmartVideoExporter
                     i++; inputIndex++;
                 }
                 if (!block.Render) continue;
-                using var decoder = new ExportFrameReader(info.Path, block.End - block.Start,
-                    ExportFrameReader.ShouldPrefetch(info.Width, info.Height, block.End - block.Start), cancellation, block.Start, true);
                 var first = true;
                 using var encoder = new H264Encoder(info.Width, info.Height, budget.VideoBitsPerSecond, 0, "", (pkt, codec) =>
                 {
@@ -61,23 +59,31 @@ internal static unsafe class SmartVideoExporter
                     pkt->dts = pkt->pts - plan.DecodeDelay * plan.Step; pkt->duration = plan.Step;
                     writer.Write(pkt, timeBase, false);
                 }, parameters);
+                using var decoder = new ExportFrameReader(info.Path, block.End - block.Start,
+                    ExportFrameReader.ShouldPrefetch(info.Width, info.Height, block.End - block.Start), cancellation, block.Start, true,
+                    encoder.NativeFormat, request.NeedsComposition);
                 for (var index = block.Start; index < block.End; index++)
                 {
                     cancellation.ThrowIfCancellationRequested(); var time = index / 30.0;
-                    var source = decoder.At(index);
+                    using var source = decoder.Read(index);
                     // The final audio-only fraction repeats the last frame, matching full export.
                     if (index < plan.SourceFrames && Math.Abs(source.Time - time) > .00001)
                         throw new InvalidDataException("编码区段定位未达到逐帧精度");
-                    var frame = request.Compose(source, time);
-                    cancellation.ThrowIfCancellationRequested(); encoder.Write(frame, index - block.Start); encoded++;
+                    VideoFrame? frame = null;
+                    if (request.NeedsComposition is null || request.NeedsComposition(time)) frame = request.Compose(source.Pixels, time);
+                    cancellation.ThrowIfCancellationRequested();
+                    if (frame is not null) encoder.Write(frame, index - block.Start); else encoder.Write(source, index - block.Start);
+                    encoded++;
                     audio?.WriteUntil(Math.Min(request.Project.Video.Duration, (index + 1) / 30.0), cancellation);
                     if (index % 5 == 0) Report(index + 1, "智能导出 · 渲染");
                 }
                 encoder.Flush();
+                nativeFrames += encoder.NativeFrames; bgraFrames += encoder.BgraFrames;
             }
             if (inputIndex != plan.SourceFrames || copied + encoded != plan.OutputFrames) throw new InvalidDataException("智能导出帧数不一致");
-            audio?.WriteUntil(request.Project.Video.Duration, cancellation); audio?.Flush(); writer.Finish();
-            log.Write("smart-rendered", new { copiedFrames = copied, encodedFrames = encoded, plan.CopyBytes });
+            audio?.Finish(cancellation); writer.Finish();
+            log.Write("smart-rendered", new { copiedFrames = copied, encodedFrames = encoded, nativeFrames, bgraFrames,
+                audioPackets = audio?.Packets ?? 0, audioBytes = audio?.Bytes ?? 0, plan.CopyBytes });
         }
         finally { ffmpeg.av_packet_free(&packet); }
         void Report(long frame, string stage) => progress?.Report(new(1, 0, 3 + frame / (double)plan.OutputFrames * 82, stage));

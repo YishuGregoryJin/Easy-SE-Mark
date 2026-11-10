@@ -125,6 +125,10 @@ internal static unsafe class SmartExportPlan
         // Prefer the existing pipelined full renderer when key-frame expansion saves too little.
         if (render > 0 && (render > outputCount * .6 || outputCount - render < 60 ||
             render + blocks.Count(b => b.Render) * 15 > outputCount * .7)) return SmartPlan.Skip("insufficient-unmarked-gops");
+        // Small sources favor packet reuse. Their final size is intentionally not capped:
+        // replacing a GOP (and preserving the original audio) may increase the result.
+        if (new FileInfo(path).Length <= ExportPolicy.MaxBytes)
+            return new(true, render == 0 ? "video-remux" : "closed-gop-splice", blocks, count, outputCount, delay, step, copyBytes, render);
         var budget = ExportPolicy.Budget(project.Video.Duration, info.HasAudio);
         var estimate = copyBytes + render / 30.0 * budget.VideoBitsPerSecond / 8 * 1.15 +
             project.Video.Duration * budget.AudioBitsPerSecond / 8 * 1.1 + 512_000 + outputCount * 32;

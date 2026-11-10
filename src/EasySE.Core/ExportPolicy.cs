@@ -27,9 +27,9 @@ public static class ExportPolicy
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(actualBytes);
         return (long)Math.Floor(currentTarget * Math.Min(.8, MaxBytes * .9 / actualBytes));
     }
-    public static void Verify(long actualBytes, string videoCodec, int width, int height, VideoInfo source, double fps)
+    public static void Verify(long actualBytes, string videoCodec, int width, int height, VideoInfo source, double fps, bool allowOversize = false)
     {
-        if (actualBytes <= 0 || actualBytes > MaxBytes || videoCodec != "h264" || width != source.Width || height != source.Height || Math.Abs(fps - 30) > .001)
+        if (actualBytes <= 0 || !allowOversize && actualBytes > MaxBytes || videoCodec != "h264" || width != source.Width || height != source.Height || Math.Abs(fps - 30) > .001)
             throw new InvalidDataException("导出文件未通过规格校验");
     }
     public static string SafeName(string name, string extension)
